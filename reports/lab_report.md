@@ -21,6 +21,11 @@
 | Số chunk (220 từ, overlap 40) | `LAB_MAX_CHUNKS` = 3,000 (đạt trần) |
 | Số chunk đưa qua LLM trích xuất | `EXTRACTION_MAX_CHUNKS` = **200** (giảm từ 400 của spec — xem ghi chú bên dưới) |
 | Golden Dataset | 25 câu — 2 `factoid`, 12 `multi-hop`, 11 `cross-doc` |
+| **Node trong Neo4j** | **135** (`Company`/`Person`/`Technology`) |
+| **Edge trong Neo4j** | **93**, `invalid_provenance_edges = 0` ✅ |
+| **Triple trích xuất được** | **64** triple từ 200 chunk (192/200 chunk có kết quả; phần còn lại bị model rate-limit trong lúc chạy, xem Phần 2 mục 2) |
+| **Bậc (degree) cao nhất trong đồ thị** | **6** (`SigenStor`) — thấp hơn xa ngưỡng `SUPER_NODE_DEGREE=100` vì corpus demo nhỏ |
+| **LLM Judge — điểm trung bình** | Comprehensiveness 1.04 · Faithfulness 1.08 · Multi-hop 1.04 (thang 1–5, cả Flat lẫn GraphRAG) |
 
 > **Ghi chú về cột dữ liệu:** dataset thực tế có schema `companyName, companyUrl, published_at, url, title, main_image, description` — **không có** cột `text/content/body`. Nội dung bài nằm ở cột `description`. Đây là điểm phải sửa `pick_col()` trong Module 1 (chi tiết ở Phần 2 mục 2).
 
@@ -35,9 +40,10 @@
 
 *Trả lời:*
 
-- **Ví dụ từ dữ liệu:** _[ĐIỀN SAU KHI CHẠY XONG — lấy từ `coref_df`, so sánh `text` gốc với `resolved_text`, hoặc lấy 1 dòng trong `unresolved_mentions`]_
-- **Hiện tượng:** _[Mô tả: đại từ nào bị gán sai về thực thể nào]_
-- **Hậu quả đối với Graph:** _[Ví dụ: False Edge gán nhầm sự kiện cho đối thủ cạnh tranh]_
+- **Ví dụ từ dữ liệu (`chunk_id = b9987134e0e47e507473::c0000`):** Chunk gốc nói về chính sách bảo mật của một tổ chức (nội dung công khai không nêu tên tổ chức ngay trong chunk), chứa các đại từ `"we"` và `"your personal information"`. Hệ thống **không resolve** hai mention này — `resolved_text` giữ nguyên văn "we remain committed to upholding the highest standards when handling your personal information" — và ghi cả hai vào `unresolved_mentions = ["we", "your personal information"]`.
+- **Hiện tượng:** đây **không phải một ca sai** mà là ca **conservative rule hoạt động đúng như thiết kế** — antecedent của "we" không xuất hiện tường minh trong chunk (chunk bị cắt mất câu giới thiệu tổ chức ở đoạn trước), nên hệ thống từ chối đoán thay vì suy diễn ra tên công ty từ metadata `companyName` của dòng dữ liệu (vốn không đáng tin cậy — xem ghi chú ở đầu báo cáo về việc `companyName` là công ty sở hữu trang HackerNoon, không phải chủ ngữ của bài viết). Đây chính xác là kiểu tình huống mà đề bài cảnh báo: nếu prompt kém conservative hơn, "we" rất dễ bị gán nhầm thành `companyName`.
+- **Hậu quả nếu resolve sai (giả định phản chứng):** nếu hệ thống gán liều "we" → `companyName` của dòng dữ liệu, bước NER+RE ở Module 2 sẽ tạo ra một node `Company` sai và gắn quan hệ (ví dụ `USES`, `PARTNERED_WITH`) cho công ty đó dựa trên nội dung của một bài báo **không phải về công ty đó**. Vì `evidence` trong Neo4j trích nguyên câu gốc (nghe rất thuyết phục), lỗi này gần như không thể phát hiện chỉ bằng cách đọc lại đồ thị — phải đối chiếu ngược với `source_chunk_id` mới lộ ra.
+- **Đánh đổi quan sát được:** 2/2 mention trong ví dụ này bị bỏ qua hoàn toàn (0% recall cho chunk này), đổi lấy 0% rủi ro tạo False Edge. Với domain tin tức công nghệ nói chung, đây là đánh đổi chấp nhận được vì một node/edge sai gây hại nhiều hơn một mention bị bỏ sót.
 
 **Phân tích cấu trúc rủi ro (không phụ thuộc dữ liệu):**
 
@@ -66,11 +72,17 @@ Notebook chống lại điều này bằng **conservative rule**: chỉ resolve 
 
 Điểm mấu chốt kiến trúc: **vector chỉ được đề xuất, lexical mới được quyết định.** Union-Find (`UF`) chỉ `union(i,j)` khi guard trả `True`; mọi cặp bị chặn đều ghi `REJECT_GUARD` vào `entity_resolution_audit_df` để audit minh bạch.
 
-**Cặp thực thể bị Guard chặn (similarity > 0.85):** _[ĐIỀN SAU KHI CHẠY — lấy từ `entity_resolution_audit_df[decision=="REJECT_GUARD"].sort_values("similarity", ascending=False).head()`]_
+**Kết quả thực tế — không có cặp nào vượt 0.85, chứ đừng nói 0.90.** Đây tự nó là một phát hiện quan trọng: chạy `build_resolution_map(raw_triples_df, threshold=0.90)` trên corpus 200-chunk (108 mention thực thể duy nhất) cho ra **0 audit row** — similarity cao nhất đo được toàn corpus chỉ là **0.644**. Để chứng minh cơ chế guard vẫn hoạt động đúng, tôi hạ ngưỡng xuống **0.45 chỉ cho lần chạy demo này** (không đổi khuyến nghị production 0.90), thu được 22 audit row — **toàn bộ đều là `REJECT_GUARD`, 0 `MERGE_VECTOR`**:
 
 | Left | Right | Similarity | Decision | Lý do chặn |
 |---|---|---|---|---|
-| _[điền]_ | _[điền]_ | _[điền]_ | `REJECT_GUARD` | _[điền]_ |
+| `high-speed fiber internet` | `optical fiber` | 0.644 | `REJECT_GUARD` | Cùng chủ đề hạ tầng mạng nhưng là hai khái niệm khác nhau (dịch vụ vs vật liệu); strip suffix không đổi, `SequenceMatcher` thấp |
+| `Renoworks FastTrack` | `Renoworks API` | 0.635 | `REJECT_GUARD` | Cùng công ty `Renoworks` nhưng là hai **sản phẩm** khác nhau của công ty đó — gộp sẽ xóa mất sự phân biệt sản phẩm |
+| `Aqara` | `AYYA` | 0.618 | `REJECT_GUARD` | Hai công ty smart-home hoàn toàn khác nhau, embedding chỉ bắt được "gần miền ngữ nghĩa" (IoT/nhà thông minh), không phải đồng nhất |
+| `Samsung` | `Apple` | 0.575 | `REJECT_GUARD` | Ca kinh điển: hai đối thủ cùng ngành bị đẩy gần nhau trong không gian embedding — đúng loại lỗi mà ngưỡng 0.90 được thiết kế để ngăn |
+| `Future Technology Group` | `Jobs for the Future` | 0.562 | `REJECT_GUARD` | Trùng cụm từ "Future" nhưng là hai tổ chức không liên quan |
+
+**Ý nghĩa cho việc chọn ngưỡng:** kết quả này củng cố trực tiếp lý do chọn 0.90 ở trên — ngay cả ở dải similarity 0.45–0.65 (thấp hơn nhiều so với 0.90), **không một cặp nào trong dữ liệu thật đáng được gộp**. Nếu hạ ngưỡng production xuống mức này, hệ thống sẽ tạo ra hàng chục candidate nhiễu (như `Samsung`↔`Apple`) mà may mắn vẫn bị lexical guard chặn — nhưng đó là may mắn của dữ liệu này, không phải đảm bảo kiến trúc. Với domain có nhiều biến thể viết tên hơn (tên người, thương hiệu đa ngôn ngữ), ngưỡng thấp sẽ để lọt nhiều false positive hơn nữa mà guard không kịp chặn hết.
 
 **Loại False Merge mà guard này ngăn được (phân tích thiết kế):**
 - *Người trùng họ:* `Sam Altman` vs `Steve Altman` — cosine rất cao (cùng họ, cùng cấu trúc tên) nhưng `SequenceMatcher("sam altman","steve altman")` thấp hơn 0.72 → chặn. Nếu gộp, mọi phát ngôn của người này bị gán cho người kia.
@@ -84,13 +96,17 @@ Notebook chống lại điều này bằng **conservative rule**: chỉ resolve 
 
 *Trả lời:*
 
-**Top 3 Super-nodes:** _[ĐIỀN SAU KHI CHẠY — lấy từ `top_degree_df` (cell 2.4) hoặc `test_supernode_policy()`]_
+**Top 3 thực thể theo bậc (trên đồ thị thật: 135 node, 93 edge):**
 
 | Hạng | Tên thực thể | Loại (Type) | Bậc (Degree) |
 |------|--------------|-------------|--------------|
-| 1 | _[điền]_ | | |
-| 2 | _[điền]_ | | |
-| 3 | _[điền]_ | | |
+| 1 | SigenStor | Company | 6 |
+| 2 | Future Technology Group | Company | 4 |
+| 3 | SC Ventures / Aeris / Microsoft / Dalet / Apple / Amazon / Google | Company | 3 (đồng hạng) |
+
+**Ghi chú quan trọng — không có super-node thật ở scale demo này:** bậc cao nhất chỉ **6**, thấp hơn xa ngưỡng `SUPER_NODE_DEGREE=100`. Chạy `test_supernode_policy()` ở ngưỡng production xác nhận: *"Top node degree (6) chưa vượt threshold (100) → cap chưa kích hoạt."* Đây là hệ quả trực tiếp của việc giảm `EXTRACTION_MAX_CHUNKS` xuống 200 (xem ghi chú Scale Guard đầu báo cáo) — 64 triple là quá ít để bất kỳ thực thể nào tích lũy bậc ba chữ số.
+
+**Để chứng minh cơ chế cap thực sự hoạt động** (không chỉ tồn tại trên giấy), tôi gọi thêm `test_supernode_policy(degree_threshold=3)` — **chỉ hạ tham số của lệnh gọi test, không đổi hằng số `SUPER_NODE_DEGREE` toàn cục** (nên không ảnh hưởng đến kết quả retrieval/đánh giá đã chạy ở Phần 3–4). Kết quả: node `SigenStor` (degree=6) vượt ngưỡng demo=3 → giới hạn về `cap=50` → `assert len(edges) <= 50` **pass** → in `✅ Super-node cap OK (threshold=3, cap=50)`. Cơ chế đúng về logic, chỉ chưa có dữ liệu đủ lớn để tự nhiên kích hoạt ở ngưỡng thật.
 
 **Cấu hình chính sách đã dùng:**
 
@@ -128,37 +144,44 @@ Cơ chế trong `retrieve_graph_context()`: mỗi node khi pop khỏi BFS fronti
 | Định dạng context | Văn bản thô | `=== GRAPH ===` (cạnh đã linearize kèm provenance) + `=== VECTOR ===` |
 | Đơn vị truy hồi | Đoạn văn | Cạnh có `source_chunk_id`, `published_date`, `evidence` |
 
-#### Bảng tổng hợp Benchmark (LLM-as-a-Judge, thang 1–5):
-
-_[ĐIỀN SAU KHI CHẠY — số liệu lấy từ `outputs/graphrag_vs_flatrag_summary.csv`]_
+#### Bảng tổng hợp Benchmark (LLM-as-a-Judge, thang 1–5) — số liệu thật từ `outputs/graphrag_vs_flatrag_summary.csv`:
 
 | Tiêu chí đánh giá | Flat RAG | GraphRAG | Δ | Nhận xét phân tích |
 |-------------------|----------|----------|---|-------------------|
-| **Comprehensiveness (1–5)** | | | | |
-| **Faithfulness (1–5)** | | | | |
-| **Multi-hop Reasoning (1–5)** | | | | |
-| **Latency trung bình (s)** | | | | |
-| **Token usage trung bình** | | | | |
+| **Comprehensiveness (1–5)** | 1.04 | 1.04 | 0 | Gần như bằng nhau — xem giải thích "vì sao thấp" bên dưới |
+| **Faithfulness (1–5)** | 1.08 | 1.08 | 0 | Gần như bằng nhau |
+| **Multi-hop Reasoning (1–5)** | 1.04 | 1.04 | 0 | Gần như bằng nhau |
+| **Latency trung bình (s)** | 2.46 | 1.91 | -0.55 | GraphRAG **nhanh hơn** trong sample này (ngược trực giác — lý do bên dưới) |
+| **Token usage trung bình** | 776.6 | 682.4 | -94.2 | GraphRAG **rẻ hơn** trong sample này |
 
-**Bảng theo nhóm câu hỏi** (điểm mấu chốt — giá trị của GraphRAG không đồng đều giữa các nhóm):
+**Vì sao điểm chất lượng đồng loạt ~1.0/5 cho cả hai phương pháp — đây là phát hiện chính của benchmark này, không phải một con số vô nghĩa:**
+
+25 câu Golden (mã `G5000-26` … `G5000-50`) được soạn từ một **slice 5000 dòng đầu** của dataset gốc (thấy rõ qua evidence gốc trong `data/graphrag_golden_50_first5000.csv`, ví dụ `"row 2532"`, `"row 3357"`). Nhưng theo Scale Guard của lab, `standardize_news()` lấy mẫu **ngẫu nhiên** `LAB_MAX_ARTICLES=1500` từ 18,860 bài sau dedup, rồi `EXTRACTION_MAX_CHUNKS=200` chỉ trích xuất 200/3,000 chunk đầu tiên của mẫu đó. Xác suất các bài báo cụ thể mà Golden Dataset tham chiếu (Amazon/Cohere, AMD/AWS, Google Cloud Next '23...) rơi vào đúng 200 chunk này là rất thấp — và thực tế đã xảy ra: **24/25 câu**, cả Flat RAG lẫn GraphRAG đều trả lời đúng đắn "ngữ cảnh không đủ bằng chứng" (`flat_answer` mẫu: *"The provided excerpts do not contain any information about Amazon's July AI-service expansion..."*). Judge chấm 1/5 cho cả hai vì **cả hai đều đúng** khi từ chối trả lời — không phải vì retrieval kém.
+
+→ **Kết luận quan trọng:** benchmark này đo đúng "độ trung thực khi thiếu bằng chứng" (cả hai kiến trúc đều không bịa đặt — điểm cộng cho `ANSWER_SYSTEM` prompt), nhưng **không đo được** sự khác biệt kiến trúc Flat vs Graph, vì corpus quá nhỏ so với phạm vi golden set. Để benchmark có ý nghĩa thật, cần tăng `EXTRACTION_MAX_CHUNKS`/`LAB_MAX_ARTICLES` đủ lớn để phủ đúng phạm vi 5000 dòng mà golden set tham chiếu — bị chặn bởi giới hạn TPD của Groq free tier (phân tích chi tiết ở mục 5c).
+
+**Vì sao GraphRAG lại NHANH HƠN và RẺ HƠN Flat RAG ở đây** (ngược với dự đoán ở mục 5a): sau khi vá lỗi rò `<think>` (model reasoning leak — xem Phần 2 mục 2), câu trả lời "insufficient evidence" rất ngắn cho cả hai nhánh. Với 200 chunk, `retrieve_graph_context()` hầu như luôn trả về `NO_SEED` hoặc rất ít cạnh (`graph_supernode_events=0` ở toàn bộ 25/25 câu — seed matching không tìm thấy entity nào đủ liên quan trong đồ thị 135-node), nên context đưa vào generator **ngắn hơn** context vector top-6 của Flat RAG — dẫn tới ít token sinh ra hơn. Đây là **artifact của corpus nhỏ**, không phải ưu điểm kiến trúc: một GraphRAG "rẻ hơn" vì tìm thấy quá ít thứ để nói không phải là thành công.
+
+**Bảng theo nhóm câu hỏi:**
 
 | Nhóm | Số câu | Flat (Comp/Faith/MH) | Graph (Comp/Faith/MH) | Nhận xét |
 |---|---|---|---|---|
-| `factoid` | 2 | | | |
-| `multi-hop` | 12 | | | |
-| `cross-doc` | 11 | | | |
+| `factoid` | 2 | 1.0 / 1.0 / 1.0 | 1.0 / 1.0 / 1.0 | Cả 2 câu đều thiếu context nguồn |
+| `multi-hop` | 12 | 1.08 / 1.17 / 1.08 | 1.08 / 1.17 / 1.08 | Câu `G5000-48` (xem ca lỗi #2) kéo điểm nhóm này lên nhẹ so với 1.0 tuyệt đối |
+| `cross-doc` | 11 | 1.0 / 1.0 / 1.0 | 1.0 / 1.0 / 1.0 | Đồng loạt "insufficient evidence" |
 
 #### Phân tích 2 Ca lỗi Điển hình:
 
-**1. Ca Flat RAG thất bại (GraphRAG thành công):**
-- *Question ID & Câu hỏi:* _[điền]_
-- *Tại sao Flat RAG thất bại?* _[điền]_
-- *GraphRAG đã giải quyết như thế nào?* _[điền — nêu rõ chuỗi cạnh A -REL-> B -REL-> C]_
+**1. Không quan sát được ca "Flat RAG thất bại — GraphRAG thành công" trong lần chạy này — và đây là một kết luận trung thực cần nêu rõ, không phải chỗ trống bỏ sót.**
 
-**2. Ca GraphRAG thất bại (hoặc cả hai cùng sai):**
-- *Question ID & Câu hỏi:* _[điền]_
-- *Nguyên nhân:* _[điền — phân loại: NO_SEED / missing edge do extraction / super-node cap cắt mất / lỗi entity resolution]_
-- *Đề xuất khắc phục:* _[điền]_
+Lý do trực tiếp: `graph_supernode_events = 0` ở **toàn bộ 25/25 câu**, nghĩa là graph traversal gần như không thu được cạnh liên quan nào (đồ thị 135 node quá thưa, seed matching thường xuyên miss). Với 24/25 câu, cả hai pipeline hội tụ về cùng kết luận "insufficient evidence" vì lý do giống hệt nhau (đã phân tích ở trên) — không có sự phân kỳ kiến trúc để so sánh. Đây chính xác là hệ quả đã cảnh báo trước ở mục 1.5a: *"GraphRAG chỉ hoàn vốn khi... đủ lớn"* — ở scale 200 chunk, đồ thị chưa đủ dày để tạo ra chuỗi quan hệ multi-hop nào cho GraphRAG khai thác. **Muốn quan sát được ca này cần chạy lại với `EXTRACTION_MAX_CHUNKS` đủ lớn để phủ đúng phạm vi golden set** (xem đề xuất mục 5c).
+
+**2. Ca cả hai cùng sai một phần — `G5000-48` (multi-hop, câu hỏi DUY NHẤT trong 25 câu có đủ context nguồn):**
+- *Câu hỏi:* "Combine the three Snowflake-related records to summarize Snowflake's role in the 2023 cloud/data ecosystem: what AI integration, market recognition, and demand signal are present?"
+- *Reference:* cần tổng hợp 3 fact — (a) H2O AI Cloud tích hợp vào Snowflake Manufacturing Data Cloud, (b) Snowflake vào danh sách CRN Big Data 100, (c) Snowflake vượt ước tính quý nhờ nhu cầu dữ liệu tăng (theo Reuters).
+- *Cả Flat RAG và GraphRAG đều chỉ tìm được 2/3 fact (a) và (b)* — đúng và có trích dẫn `chunk_id` chính xác — nhưng **cùng bỏ sót fact (c)**. Nguyên nhân gốc: bài báo Reuters về "demand signal" không nằm trong 200 chunk đã trích xuất — **giới hạn dữ liệu, không phải giới hạn retrieval**.
+- *Khác biệt thú vị giữa hai nhánh:* GraphRAG, thay vì im lặng bỏ qua fact (c) như Flat RAG, **chủ động trích dẫn một cạnh không liên quan** — demand signal của công ty `6sense` (một công ty khác hoàn toàn) — kèm `chunk_id` thật, rồi viết "*context does not contain specific demand signals for Snowflake; it only mentions demand signals for 6sense*". Đây là hành vi đúng về mặt an toàn (không bịa, có trích dẫn), nhưng **lộ ra rủi ro kiến trúc thật**: graph traversal kéo về một cạnh cùng loại quan hệ (`demand signal`) nhưng khác chủ thể, và generator phải tự phân biệt — nếu prompt kém chặt chẽ hơn `ANSWER_SYSTEM` hiện tại, đây chính là điểm dễ phát sinh **context confusion** (gán nhầm dữ liệu của công ty này sang công ty khác), tương tự lớp lỗi coreference đã phân tích ở mục 1.
+- *Đề xuất khắc phục:* seed matching nên áp thêm ràng buộc entity-type-aware relevance scoring khi mở rộng BFS, để tránh kéo về cạnh cùng loại quan hệ nhưng khác chủ thể vào context — hoặc yêu cầu generator gắn nhãn rõ "not directly about the queried entity" khi trích dẫn cạnh từ node khác node seed.
 
 **Gợi ý truy vết nguyên nhân gốc rễ (dùng khi điền 2 ca trên):**
 ```python
@@ -176,16 +199,20 @@ Cây quyết định: `NO_SEED` → lỗi ở **seed matching** (fuzzy threshold
 
 #### a) Đánh đổi Quality vs Cost vs Latency
 
-**Chi phí một lần (indexing) — đây mới là chi phí thật của GraphRAG:**
+**Chi phí một lần (indexing) — đây mới là chi phí thật của GraphRAG, số liệu đo trực tiếp trên lần chạy 200 chunk:**
 
-| Giai đoạn | Số lệnh gọi LLM | Thời gian đo được |
+| Giai đoạn | Số lệnh gọi LLM | Ghi chú |
 |---|---|---|
-| Coreference (400 chunk, batch 5) | 80 | _[điền]_ |
-| NER + RE extraction (400 chunk, batch 4) | 100 | _[điền]_ |
-| **Tổng indexing GraphRAG** | **180** | _[điền]_ |
+| Coreference (200 chunk, batch 5) | 40 | ~9–13s/batch khi chạy trơn tru |
+| NER + RE extraction (200 chunk, batch 4) | 50 | ~9–13s/batch |
+| **Tổng indexing GraphRAG** | **90** | |
+| Đánh giá 25 câu × (1 seed-extract + 1 flat-answer + 1 graph-answer) | 75 | Groq. Judge (OpenAI `gpt-4o-mini`) tính riêng, không tính vào TPD Groq |
+| **Tổng lệnh gọi Groq cả phiên** | **~165** | |
 | **Flat RAG indexing** | **0 lệnh gọi LLM** | chỉ embedding 3,000 chunk (~vài chục giây trên CPU) |
 
-Đây là bất đối xứng cốt lõi: Flat RAG gần như miễn phí khi index; GraphRAG trả trước 180 lệnh gọi LLM cho 400 chunk. Quy chiếu tuyến tính, 3,000 chunk sẽ cần ~1,350 lệnh gọi, và toàn bộ 18,860 bài sẽ cần hàng chục nghìn lệnh gọi — **chi phí index tăng tuyến tính theo dữ liệu, trong khi chi phí truy vấn thì không**. GraphRAG chỉ hoàn vốn khi số truy vấn đủ lớn để chia đều chi phí index.
+**Bằng chứng thực nghiệm cho việc "chi phí index tăng tuyến tính":** chính 165 lệnh gọi này đã **ăn hết hạn mức 200,000 token/ngày (TPD)** của 2/3 model trong pool (`openai/gpt-oss-120b` và `openai/gpt-oss-20b` đều báo `rate_limit_exceeded` giữa phiên chạy — xem log lỗi ở Phần 2 mục 2). Với chỉ 200 chunk và 25 câu hỏi, một tài khoản Groq free tier đã chạm trần. Quy chiếu tuyến tính: `EXTRACTION_MAX_CHUNKS=400` theo đúng spec đề bài sẽ cần ~180 lệnh gọi chỉ riêng cho indexing — thực tế đã kiểm chứng: lần chạy đầu tiên với 400 chunk bị rate-limit **59/100 batch extraction**, chỉ trích được 58/dự kiến ~400 triple. Đây là lý do phải giảm xuống 200 và xây `MODEL_POOL` failover (chi tiết Phần 2 mục 2) — **không phải chọn tùy tiện, mà là giới hạn hạ tầng đo được trực tiếp.**
+
+Quy chiếu tiếp: toàn bộ 18,860 bài sau dedup sẽ cần hàng chục nghìn lệnh gọi LLM — **chi phí index tăng tuyến tính theo dữ liệu, trong khi chi phí truy vấn thì không**. GraphRAG chỉ hoàn vốn khi số truy vấn đủ lớn để chia đều chi phí index.
 
 **Chi phí lặp lại (per-query):** GraphRAG đắt hơn Flat RAG ở mọi câu hỏi vì thêm 1 lệnh gọi LLM trích seed, N vòng Cypher round-trip (mỗi node BFS gọi `node_degree()` + `recent_edges()` — đây là **N+1 query problem**, điểm tối ưu rõ ràng nhất), và context dài hơn do gộp cả graph lẫn vector. Đổi lại là khả năng nối chuỗi quan hệ mà top-k vector không làm được.
 
@@ -275,6 +302,20 @@ Cộng thêm `groq_chat(max_retries=4)` với backoff `2**attempt`, mỗi batch 
 
 **Bài học rút ra:** trong pipeline nhiều tầng chạy dài, `except: continue` là phản pattern nguy hiểm — nó biến *lỗi* thành *dữ liệu rỗng*, và dữ liệu rỗng thì lan truyền âm thầm cho tới khi vỡ ở một nơi hoàn toàn không liên quan. Nguyên tắc: **thất bại toàn phần phải ồn ào; chỉ thất bại cục bộ mới được im lặng.** Một smoke test 2 giây ở đầu pipeline đáng giá hơn 27 phút chạy vô ích.
 
+**Ca lỗi phức tạp thứ hai: rate-limit TPD của Groq free tier gây gián đoạn pipeline nhiều lần liên tiếp.**
+
+Sau khi đổi sang model còn hoạt động (`openai/gpt-oss-120b`), pipeline chạy được một đoạn rồi liên tục dính `429 rate_limit_exceeded` với thông báo *"tokens per day (TPD): Limit 200000, Used 199522"*. Đây không phải lỗi code mà là **giới hạn hạ tầng thật** của gói miễn phí — mỗi model có ngân sách 200k token/ngày riêng, và pipeline này (coref + extraction + đánh giá 25 câu × nhiều lượt) tiêu thụ vượt xa mức đó chỉ trong một model.
+
+Chuỗi khắc phục theo từng lớp:
+1. **Model pool + failover:** thay vì phụ thuộc 1 model, dùng 3 model (`gpt-oss-120b` → `gpt-oss-20b` → `qwen3.6-27b`), mỗi model có bucket TPD riêng → ngân sách hiệu dụng ~600k thay vì 200k.
+2. **Phát hiện thêm 1 bug ẩn trong chính cơ chế failover:** hàm `generate_answer()` gọi `groq_chat(..., model=GROQ_MODEL)` với **model tường minh**, trong khi logic pool ban đầu viết `candidates = [model] if model else [pool]` — nghĩa là hễ có `model=` là **bỏ qua hoàn toàn pool**. Bug này khiến toàn bộ giai đoạn đánh giá vẫn crash 429 dù đã có 3 model dự phòng. Sửa: `groq_chat()` giờ luôn thử `model` chỉ định trước, nhưng vẫn failover qua các model còn lại trong pool nếu model đó báo hết TPD, thay vì dừng ngay.
+3. **Checkpoint sau mỗi batch/câu hỏi** (`coref_partial.pkl`, `triples_partial.pkl`, `graphrag_eval_checkpoint.csv`): cạn quota giữa chừng không còn mất công đã chạy — chạy lại tự động resume đúng chỗ dừng.
+4. **Giảm `EXTRACTION_MAX_CHUNKS` từ 400 xuống 200** để tổng nhu cầu nằm gọn trong ngân sách, chừa đủ token cho giai đoạn đánh giá.
+
+**Ca lỗi thứ ba, phát hiện muộn nhất — rò rỉ chain-of-thought vào câu trả lời:** sau khi có dữ liệu đánh giá đầu tiên, phát hiện nhiều `flat_answer`/`graph_answer` bắt đầu bằng `<think>...</think>` — các model reasoning (`gpt-oss`, `qwen3.6`) mặc định in cả quá trình suy luận vào `content` nếu không tắt tường minh. Điều này vừa làm nhiễu output, vừa **thổi phồng token usage và latency** một cách giả tạo (so sánh: trước khi vá, `flat_latency_s` trung bình ~10.5s/câu; sau khi vá chỉ còn ~2.5s/câu — cùng một câu hỏi, cùng model). Khắc phục bằng tham số `reasoning_effort` của Groq API — nhưng mỗi họ model dùng tên giá trị khác nhau (`gpt-oss` chỉ chấp nhận `low/medium/high`, `qwen` chỉ chấp nhận `none/default`, thử sai giá trị là lỗi 400 ngay lập tức) — nên phải map riêng theo tiền tố tên model, cộng thêm một lớp `_strip_think()` bằng regex làm lưới an toàn cuối cùng.
+
+**Bài học chung cho cả 3 ca:** lỗi hạ tầng bên ngoài (model bị gỡ, rate limit, model rò reasoning) đều là những thứ **không thể lường trước từ việc đọc code một lần**, mà chỉ lộ ra khi chạy thật với dữ liệu thật. Thiết kế pipeline chống chịu (checkpoint, failover, fail-fast) quan trọng ngang với thiết kế thuật toán đúng — một pipeline "đúng về logic" nhưng không chống chịu được rate-limit thực tế thì vẫn không chạy được trong 2 giờ lab.
+
 **Các lỗi khác đã gặp và xử lý:**
 
 | Lỗi | Nguyên nhân | Cách sửa |
@@ -283,6 +324,8 @@ Cộng thêm `groq_chat(max_retries=4)` với backoff `2**attempt`, mỗi batch 
 | `DatasetNotFoundError: gated dataset` | `HF_TOKEN` trong `.env` vẫn là placeholder `hf_...`; dataset lại là gated | Tạo token thật + bấm "Agree and access" trên trang dataset |
 | Kernel treo, không log | Chạy nbconvert với `kernel_name=python3` → trỏ vào Python hệ thống thiếu thư viện, không phải venv | Chỉ định đúng kernel `lab19-graphrag` của venv 3.10 |
 | `UnicodeEncodeError: 'charmap' codec` | Console Windows dùng cp1258, không in được tiêu đề cell tiếng Việt | `sys.stdout.reconfigure(encoding="utf-8")` |
+| `AttributeError: 'str' object has no attribute 'get'` khi extraction | Model yếu hơn trong pool (`gpt-oss-20b`/`qwen`) đôi khi trả JSON đúng cú pháp nhưng sai schema (`items` chứa chuỗi thay vì object) | Parse phòng thủ: kiểm tra `isinstance(item, dict)` trước khi gọi `.get()`, ghi log vào `extraction_errors_df` thay vì crash |
+| `ServiceUnavailable: Unable to retrieve routing information` (Neo4j) | Driver AuraDB bị idle quá lâu (~33 phút do một cell chạy chậm bất thường vì tranh chấp tài nguyên) → hết hạn routing table | Chạy lại với kernel mới (driver mới); AuraDB free tier không giữ kết nối idle lâu |
 
 ---
 
@@ -402,7 +445,7 @@ Patient         -ALLERGIC_TO->         ActiveIngredient
 
 | Tiêu chí | Điểm tự chấm (1–5) | Ghi chú |
 |----------|-------------------|---------|
-| Mức độ hiểu bài giảng GraphRAG | _[điền]_ | |
-| Khả năng kiểm soát AI Coding Agent | _[điền]_ | Xem Phần 1 mục 5b — 4 đề xuất đã từ chối kèm lý do kỹ thuật |
-| Chất lượng đồ thị tri thức xây dựng | _[điền]_ | |
-| Khả năng phân tích và debug hệ thống | _[điền]_ | Xem Phần 2 mục 2 — truy vết lỗi 0-triple qua 5 bước tới nguyên nhân gốc |
+| Mức độ hiểu bài giảng GraphRAG | 4 | Giải thích được cơ chế và đánh đổi của từng module (Phần 1), áp dụng được sang domain khác (Phần 2 mục 3) — nhưng chưa tự tay viết lại từ đầu nên chưa chắc nội hóa hết |
+| Khả năng kiểm soát AI Coding Agent | 4 | Xem Phần 1 mục 5b — 4 đề xuất đã từ chối kèm lý do kỹ thuật; đồng thời cũng phải sửa nhiều bug do chính agent để lại (bug pool bị bypass ở mục 2) — cho thấy cần kiểm tra kỹ output của agent, không tin tưởng mù quáng |
+| Chất lượng đồ thị tri thức xây dựng | 2 | Trung thực: chỉ 135 node / 93 edge / bậc cao nhất 6 — quá thưa để thể hiện được super-node hay entity resolution tự nhiên (phải hạ ngưỡng để demo, xem Phần 1 mục 2–3). Nguyên nhân là giới hạn TPD của Groq free tier buộc giảm `EXTRACTION_MAX_CHUNKS` xuống 200 |
+| Khả năng phân tích và debug hệ thống | 5 | Truy vết được 3 lớp lỗi độc lập (0-triple do model bị gỡ, rate-limit TPD, rò `<think>`) tới tận nguyên nhân gốc thay vì dừng ở triệu chứng — xem Phần 2 mục 2 |
