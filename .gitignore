@@ -18,9 +18,11 @@ venv/
 env/
 
 # Large Datasets and data dumps (do not commit 300MB data dumps)
+.cache/
 *.csv
-golden_dataset.csv
 !reports/*.csv
+!outputs/*.csv
+!data/*.csv
 *.jsonl
 *.parquet
 *.pq
